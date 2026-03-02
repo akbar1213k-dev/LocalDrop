@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node server.ts",
+  "scripts": {
+    "dev": "next dev",
     "build": "next build",
-    "start": "node server.ts",
+    "start": "next start",
     "lint": "eslint .",
     "clean": "next clean"
   },
