@@ -1,0 +1,5 @@
+{
+  "name": "LocalDrop",
+  "description": "P2P local file sharing and messaging application using WebRTC.",
+  "requestFramePermissions": []
+}
