@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { ref, set, get, onDisconnect, push, onChildAdded, onChildRemoved, remove } from 'firebase/database';
+import { database } from '@/lib/firebase';
 import { v4 as uuidv4 } from 'uuid';
 import { UAParser } from 'ua-parser-js';
 import { uniqueNamesGenerator, adjectives, animals, colors } from 'unique-names-generator';
@@ -36,7 +37,7 @@ export type FileTransfer = {
 const CHUNK_SIZE = 16 * 1024; // 16KB
 
 export function useWebRTC() {
-  const [socket, setSocket] = useState<Socket | null>(null);
+  // State socket.io telah dihapus
   const [me, setMe] = useState<Peer | null>(null);
   const [peers, setPeers] = useState<Record<string, Peer>>({});
   const [messages, setMessages] = useState<Message[]>([]);
@@ -133,13 +134,25 @@ export function useWebRTC() {
       style: 'capital',
     });
 
-    const newSocket = io({
-      path: '/socket.io',
-    });
+    const myId = uuidv4();
+    const myData = { id: myId, name: randomName, device: deviceName };
+    setMe(myData);
 
-    setSocket(newSocket);
+    const meRef = ref(database, `peers/${myId}`);
+    const signalsRef = ref(database, `signals/${myId}`);
+    const allPeersRef = ref(database, `peers`);
 
-    let myId = '';
+    // Hapus data secara otomatis dari Firebase saat tab ditutup atau offline
+    onDisconnect(meRef).remove();
+    onDisconnect(signalsRef).remove();
+
+    // Daftarkan perangkat ini ke jaringan Firebase
+    set(meRef, myData);
+
+    const sendSignal = (to: string, signalData: any) => {
+      const toSignalRef = ref(database, `signals/${to}`);
+      push(toSignalRef, { from: myId, signal: JSON.stringify(signalData) });
+    };
 
     const setupDataChannel = (peerId: string, dc: RTCDataChannel) => {
       dataChannels.current[peerId] = dc;
@@ -226,10 +239,10 @@ export function useWebRTC() {
       rtcConnections.current[peerId] = pc;
 
       pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          newSocket.emit('signal', { to: peerId, signal: event.candidate });
-        }
-      };
+      if (event.candidate) {
+        sendSignal(peerId, event.candidate);
+      }
+    };
 
       pc.ondatachannel = (event) => {
         setupDataChannel(peerId, event.channel);
@@ -245,50 +258,57 @@ export function useWebRTC() {
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      newSocket.emit('signal', { to: peerId, signal: offer });
+      sendSignal(peerId, offer);
     };
 
-    newSocket.on('connect', () => {
-      myId = newSocket.id!;
-      const myData = { name: randomName, device: deviceName };
-      setMe({ id: myId, ...myData });
-      newSocket.emit('join', myData);
-    });
-
-    newSocket.on('peers', (existingPeers: Peer[]) => {
-      const peersMap: Record<string, Peer> = {};
-      existingPeers.forEach((p) => {
-        peersMap[p.id] = p;
-        initiateConnection(p.id);
-      });
-      setPeers(peersMap);
-    });
-
-    newSocket.on('peer-joined', (peer: Peer) => {
-      setPeers((prev) => ({ ...prev, [peer.id]: peer }));
-      // Wait for the new peer to initiate the connection
-    });
-
-    newSocket.on('peer-left', (peerId: string) => {
-      setPeers((prev) => {
-        const newPeers = { ...prev };
-        delete newPeers[peerId];
-        return newPeers;
-      });
-      if (rtcConnections.current[peerId]) {
-        rtcConnections.current[peerId].close();
-        delete rtcConnections.current[peerId];
-      }
-      if (dataChannels.current[peerId]) {
-        dataChannels.current[peerId].close();
-        delete dataChannels.current[peerId];
+    get(allPeersRef).then((snapshot) => {
+      if (snapshot.exists()) {
+        const peersMap: Record<string, Peer> = {};
+        snapshot.forEach((childSnapshot) => {
+          const peer = childSnapshot.val();
+          if (peer.id !== myId) {
+            peersMap[peer.id] = peer;
+            initiateConnection(peer.id);
+          }
+        });
+        setPeers(peersMap);
       }
     });
 
-    newSocket.on('signal', async (data: { from: string; signal: any }) => {
-      const { from, signal } = data;
+    const unsubscribeChildAdded = onChildAdded(allPeersRef, (snapshot) => {
+      const peer = snapshot.val();
+      if (peer.id !== myId) {
+        setPeers((prev) => ({ ...prev, [peer.id]: peer }));
+      }
+    });
+
+    const unsubscribeChildRemoved = onChildRemoved(allPeersRef, (snapshot) => {
+      const peerId = snapshot.val().id;
+      if (peerId !== myId) {
+        setPeers((prev) => {
+          const newPeers = { ...prev };
+          delete newPeers[peerId];
+          return newPeers;
+        });
+        if (rtcConnections.current[peerId]) {
+          rtcConnections.current[peerId].close();
+          delete rtcConnections.current[peerId];
+        }
+        if (dataChannels.current[peerId]) {
+          dataChannels.current[peerId].close();
+          delete dataChannels.current[peerId];
+        }
+      }
+    });
+
+    const unsubscribeSignals = onChildAdded(signalsRef, async (snapshot) => {
+      const data = snapshot.val();
+      if (!data) return;
+      
+      const { from, signal: signalString } = data;
+      const signal = JSON.parse(signalString);
+      
       let pc = rtcConnections.current[from];
-
       if (!pc) {
         pc = createPeerConnection(from);
       }
@@ -297,16 +317,19 @@ export function useWebRTC() {
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        newSocket.emit('signal', { to: from, signal: answer });
+        sendSignal(from, answer);
       } else if (signal.type === 'answer') {
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
       } else if (signal.candidate) {
         await pc.addIceCandidate(new RTCIceCandidate(signal));
       }
+      
+      remove(snapshot.ref);
     });
 
     return () => {
-      newSocket.disconnect();
+      remove(meRef);
+      remove(signalsRef);
       Object.values(rtcConnections.current).forEach((pc) => pc.close());
     };
   }, [addMessage, updateTransfer, sendFileData]);
